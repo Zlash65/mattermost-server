@@ -78,10 +78,10 @@ func (backend *LocalBackend) GetImage(w http.ResponseWriter, r *http.Request, im
 		return
 	}
 
-	w.Header().Set("X-Frame-Options", "deny")
+	w.Header().Set("X-Frame-Options", "sameorigin")
 	w.Header().Set("X-XSS-Protection", "1; mode=block")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+	w.Header().Set("Content-Security-Policy", "Frame-ancestors 'self' *.kredily.com; default-src 'none'; img-src data:; style-src 'unsafe-inline'")
 
 	backend.impl.ServeHTTP(w, req)
 }
