@@ -116,6 +116,12 @@ func getMockCacheProvider() *mocks.CacheProvider {
 		mock.AnythingOfType("int64"),
 		mock.AnythingOfType("string")).Return(lru.New(128))
 
+	mockCacheProvider.On("NewCacheWithParams",
+		mock.AnythingOfType("int"),
+		"FileInfo",
+		mock.AnythingOfType("int64"),
+		mock.AnythingOfType("string")).Return(lru.New(128))
+
 	return &mockCacheProvider
 }
 
@@ -146,6 +152,12 @@ func getMockStore() *mocks.Store {
 	mockSchemesStore.On("Get", "123").Return(&fakeScheme, nil)
 	mockSchemesStore.On("PermanentDeleteAll").Return(nil)
 	mockStore.On("Scheme").Return(&mockSchemesStore)
+
+	fakeFileInfo := model.FileInfo{PostId: "123"}
+	mockFileInfoStore := mocks.FileInfoStore{}
+	mockFileInfoStore.On("GetForPost", "123", true, true, false).Return([]*model.FileInfo{&fakeFileInfo}, nil)
+	mockFileInfoStore.On("GetForPost", "123", true, true, true).Return([]*model.FileInfo{&fakeFileInfo}, nil)
+	mockStore.On("FileInfo").Return(&mockFileInfoStore)
 
 	fakeWebhook := model.IncomingWebhook{Id: "123"}
 	mockWebhookStore := mocks.WebhookStore{}
@@ -181,18 +193,25 @@ func getMockStore() *mocks.Store {
 	mockChannelStore.On("GetPinnedPostCount", "id", false).Return(mockPinnedPostsCount, nil)
 
 	fakePosts := &model.PostList{}
+	fakeOptions := model.GetPostsOptions{ChannelId: "123", PerPage: 30}
 	mockPostStore := mocks.PostStore{}
-	mockPostStore.On("GetPosts", "123", 0, 30, true).Return(fakePosts, nil)
-	mockPostStore.On("GetPosts", "123", 0, 30, false).Return(fakePosts, nil)
+	mockPostStore.On("GetPosts", fakeOptions, true).Return(fakePosts, nil)
+	mockPostStore.On("GetPosts", fakeOptions, false).Return(fakePosts, nil)
 	mockPostStore.On("InvalidateLastPostTimeCache", "12360")
+
+	mockPostStoreOptions := model.GetPostsSinceOptions{
+		ChannelId:        "channelId",
+		Time:             1,
+		SkipFetchThreads: false,
+	}
 
 	mockPostStoreEtagResult := fmt.Sprintf("%v.%v", model.CurrentVersion, 1)
 	mockPostStore.On("ClearCaches")
 	mockPostStore.On("InvalidateLastPostTimeCache", "channelId")
 	mockPostStore.On("GetEtag", "channelId", true).Return(mockPostStoreEtagResult)
 	mockPostStore.On("GetEtag", "channelId", false).Return(mockPostStoreEtagResult)
-	mockPostStore.On("GetPostsSince", "channelId", int64(1), true).Return(model.NewPostList(), nil)
-	mockPostStore.On("GetPostsSince", "channelId", int64(1), false).Return(model.NewPostList(), nil)
+	mockPostStore.On("GetPostsSince", mockPostStoreOptions, true).Return(model.NewPostList(), nil)
+	mockPostStore.On("GetPostsSince", mockPostStoreOptions, false).Return(model.NewPostList(), nil)
 	mockStore.On("Post").Return(&mockPostStore)
 
 	fakeTermsOfService := model.TermsOfService{Id: "123", CreateAt: 11111, UserId: "321", Text: "Terms of service test"}
@@ -216,7 +235,6 @@ func getMockStore() *mocks.Store {
 	mockUserStore.On("GetAllProfilesInChannel", "123", true).Return(fakeProfilesInChannelMap, nil)
 	mockUserStore.On("GetAllProfilesInChannel", "123", false).Return(fakeProfilesInChannelMap, nil)
 
-	mockUserStore.On("Get", "123").Return(fakeUser[0], nil)
 	mockStore.On("User").Return(&mockUserStore)
 
 	fakeUserTeamIds := []string{"1", "2", "3"}
