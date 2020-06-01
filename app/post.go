@@ -24,7 +24,7 @@ const (
 	PAGE_DEFAULT                = 0
 )
 
-func (a *App) CreatePostAsUser(post *model.Post, currentSessionId string) (*model.Post, *model.AppError) {
+func (a *App) CreatePostAsUser(post *model.Post, currentSessionId string, setOnline bool) (*model.Post, *model.AppError) {
 	// Check that channel has not been deleted
 	channel, errCh := a.Srv().Store.Channel().Get(post.ChannelId, true)
 	if errCh != nil {
@@ -42,7 +42,7 @@ func (a *App) CreatePostAsUser(post *model.Post, currentSessionId string) (*mode
 		return nil, err
 	}
 
-	rp, err := a.CreatePost(post, channel, true)
+	rp, err := a.CreatePost(post, channel, true, setOnline)
 	if err != nil {
 		if err.Id == "api.post.create_post.root_id.app_error" ||
 			err.Id == "api.post.create_post.channel_root_id.app_error" ||
@@ -72,8 +72,11 @@ func (a *App) CreatePostAsUser(post *model.Post, currentSessionId string) (*mode
 		return nil, err
 	}
 
-	// Update the LastViewAt only if the post does not have from_webhook prop set (eg. Zapier app)
-	if _, ok := post.GetProps()["from_webhook"]; !ok {
+	// Update the LastViewAt only if the post does not have from_webhook prop set (e.g. Zapier app),
+	// or if it does not have from_bot set (e.g. from discovering the user is a bot within CreatePost).
+	_, fromWebhook := post.GetProps()["from_webhook"]
+	_, fromBot := post.GetProps()["from_bot"]
+	if !fromWebhook && !fromBot {
 		if _, err := a.MarkChannelsAsViewed([]string{post.ChannelId}, post.UserId, currentSessionId); err != nil {
 			mlog.Error(
 				"Encountered error updating last viewed",
@@ -93,7 +96,7 @@ func (a *App) CreatePostMissingChannel(post *model.Post, triggerWebhooks bool) (
 		return nil, err
 	}
 
-	return a.CreatePost(post, channel, triggerWebhooks)
+	return a.CreatePost(post, channel, triggerWebhooks, true)
 }
 
 // deduplicateCreatePost attempts to make posting idempotent within a caching window.
@@ -137,7 +140,7 @@ func (a *App) deduplicateCreatePost(post *model.Post) (foundPost *model.Post, er
 	return actualPost, nil
 }
 
-func (a *App) CreatePost(post *model.Post, channel *model.Channel, triggerWebhooks bool) (savedPost *model.Post, err *model.AppError) {
+func (a *App) CreatePost(post *model.Post, channel *model.Channel, triggerWebhooks, setOnline bool) (savedPost *model.Post, err *model.AppError) {
 	foundPost, err := a.deduplicateCreatePost(post)
 	if err != nil {
 		return nil, err
@@ -315,7 +318,7 @@ func (a *App) CreatePost(post *model.Post, channel *model.Channel, triggerWebhoo
 	// to be done when we send the post over the websocket in handlePostEvents
 	rpost = a.PreparePostForClient(rpost, true, false)
 
-	if err := a.handlePostEvents(rpost, user, channel, triggerWebhooks, parentPostList); err != nil {
+	if err := a.handlePostEvents(rpost, user, channel, triggerWebhooks, parentPostList, setOnline); err != nil {
 		mlog.Error("Failed to handle post events", mlog.Err(err))
 	}
 
@@ -375,8 +378,13 @@ func (a *App) FillInPostProps(post *model.Post, channel *model.Channel) *model.A
 
 		for _, mentioned := range mentionedChannels {
 			if mentioned.Type == model.CHANNEL_OPEN {
+				team, err := a.Srv().Store.Team().Get(mentioned.TeamId)
+				if err != nil {
+					mlog.Error("Failed to get team of the channel mention", mlog.String("team_id", channel.TeamId), mlog.String("channel_id", channel.Id), mlog.Err(err))
+				}
 				channelMentionsProp[mentioned.Name] = map[string]interface{}{
 					"display_name": mentioned.DisplayName,
+					"team_name":    team.Name,
 				}
 			}
 		}
@@ -388,10 +396,15 @@ func (a *App) FillInPostProps(post *model.Post, channel *model.Channel) *model.A
 		post.DelProp("channel_mentions")
 	}
 
+	matched := model.AT_MENTION_PATTEN.MatchString(post.Message)
+	if a.License() != nil && *a.License().Features.LDAPGroups && matched && !a.HasPermissionToChannel(post.UserId, post.ChannelId, model.PERMISSION_USE_GROUP_MENTIONS) {
+		post.AddProp(model.POST_PROPS_GROUP_HIGHLIGHT_DISABLED, true)
+	}
+
 	return nil
 }
 
-func (a *App) handlePostEvents(post *model.Post, user *model.User, channel *model.Channel, triggerWebhooks bool, parentPostList *model.PostList) error {
+func (a *App) handlePostEvents(post *model.Post, user *model.User, channel *model.Channel, triggerWebhooks bool, parentPostList *model.PostList, setOnline bool) error {
 	var team *model.Team
 	if len(channel.TeamId) > 0 {
 		t, err := a.Srv().Store.Team().Get(channel.TeamId)
@@ -407,16 +420,18 @@ func (a *App) handlePostEvents(post *model.Post, user *model.User, channel *mode
 	a.invalidateCacheForChannel(channel)
 	a.invalidateCacheForChannelPosts(channel.Id)
 
-	if _, err := a.SendNotifications(post, team, channel, user, parentPostList); err != nil {
+	if _, err := a.SendNotifications(post, team, channel, user, parentPostList, setOnline); err != nil {
 		return err
 	}
 
-	a.Srv().Go(func() {
-		_, err := a.SendAutoResponseIfNecessary(channel, user)
-		if err != nil {
-			mlog.Error("Failed to send auto response", mlog.String("user_id", user.Id), mlog.String("post_id", post.Id), mlog.Err(err))
-		}
-	})
+	if post.Type != model.POST_AUTO_RESPONDER { // don't respond to an auto-responder
+		a.Srv().Go(func() {
+			_, err := a.SendAutoResponseIfNecessary(channel, user)
+			if err != nil {
+				mlog.Error("Failed to send auto response", mlog.String("user_id", user.Id), mlog.String("post_id", post.Id), mlog.Err(err))
+			}
+		})
+	}
 
 	if triggerWebhooks {
 		a.Srv().Go(func() {
@@ -1225,7 +1240,7 @@ func isPostMention(user *model.User, post *model.Post, keywords map[string][]str
 	}
 
 	// Check for keyword mentions
-	mentions := getExplicitMentions(post, keywords)
+	mentions := getExplicitMentions(post, keywords, make(map[string]*model.Group))
 	if _, ok := mentions.Mentions[user.Id]; ok {
 		return true
 	}

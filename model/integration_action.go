@@ -47,6 +47,11 @@ type PostAction struct {
 	// If the action is disabled.
 	Disabled bool `json:"disabled,omitempty"`
 
+	// Style defines a text and border style.
+	// Supported values are "default", "primary", "success", "good", "warning", "danger"
+	// and any hex color.
+	Style string `json:"style,omitempty"`
+
 	// DataSource indicates the data source for the select action. If left
 	// empty, the select is populated from Options. Other supported values
 	// are "users" and "channels".
@@ -173,8 +178,9 @@ type PostActionIntegrationRequest struct {
 }
 
 type PostActionIntegrationResponse struct {
-	Update        *Post  `json:"update"`
-	EphemeralText string `json:"ephemeral_text"`
+	Update           *Post  `json:"update"`
+	EphemeralText    string `json:"ephemeral_text"`
+	SkipSlackParsing bool   `json:"skip_slack_parsing"` // Set to `true` to skip the Slack-compatibility handling of Text.
 }
 
 type PostActionAPIResponse struct {
