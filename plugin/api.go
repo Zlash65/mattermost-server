@@ -152,6 +152,27 @@ type API interface {
 	// Minimum server version: 5.6
 	GetUsersInTeam(teamId string, page int, perPage int) ([]*model.User, *model.AppError)
 
+	// GetPreferencesForUser gets a user's preferences.
+	//
+	// @tag User
+	// @tag Preference
+	// Minimum server version: 5.26
+	GetPreferencesForUser(userId string) ([]model.Preference, *model.AppError)
+
+	// UpdatePreferencesForUser updates a user's preferences.
+	//
+	// @tag User
+	// @tag Preference
+	// Minimum server version: 5.26
+	UpdatePreferencesForUser(userId string, preferences []model.Preference) *model.AppError
+
+	// DeletePreferencesForUser deletes a user's preferences.
+	//
+	// @tag User
+	// @tag Preference
+	// Minimum server version: 5.26
+	DeletePreferencesForUser(userId string, preferences []model.Preference) *model.AppError
+
 	// GetTeamIcon gets the team icon.
 	//
 	// @tag Team
@@ -422,6 +443,12 @@ type API interface {
 	// @tag Team
 	// Minimum server version: 5.10
 	SearchPostsInTeam(teamId string, paramsList []*model.SearchParams) ([]*model.Post, *model.AppError)
+
+	// SearchPostsInTeamForUser returns a list of posts by team and user that match the given
+	// search parameters.
+	// @tag Post
+	// Minimum server version: 5.26
+	SearchPostsInTeamForUser(teamId string, userId string, searchParams model.SearchParameter) (*model.PostSearchResults, *model.AppError)
 
 	// AddChannelMember joins a user to a channel (as if they joined themselves)
 	// This means the user will not receive notifications for joining the channel.
@@ -932,6 +959,13 @@ type API interface {
 	//
 	// Minimum server version: 5.18
 	PluginHTTP(request *http.Request) *http.Response
+
+	// PublishUserTyping publishes a user is typing WebSocket event.
+	// The parentId parameter may be an empty string, the other parameters are required.
+	//
+	// @tag User
+	// Minimum server version: 5.26
+	PublishUserTyping(userId, channelId, parentId string) *model.AppError
 }
 
 var handshake = plugin.HandshakeConfig{

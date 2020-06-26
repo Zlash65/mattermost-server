@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/pkg/errors"
@@ -44,7 +45,7 @@ func (a *App) ResetPermissionsSystem() *model.AppError {
 
 	// Purge all schemes from the database.
 	if err := a.Srv().Store.Scheme().PermanentDeleteAll(); err != nil {
-		return err
+		return model.NewAppError("ResetPermissionsSystem", "app.scheme.permanent_delete_all.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
 	// Purge all roles from the database.
@@ -57,6 +58,16 @@ func (a *App) ResetPermissionsSystem() *model.AppError {
 		return err
 	}
 
+	// Remove the "System" table entry that marks the emoji permissions migration as done.
+	if _, err := a.Srv().Store.System().PermanentDeleteByName(EMOJIS_PERMISSIONS_MIGRATION_KEY); err != nil {
+		return err
+	}
+
+	// Remove the "System" table entry that marks the guest roles permissions migration as done.
+	if _, err := a.Srv().Store.System().PermanentDeleteByName(GUEST_ROLES_CREATION_MIGRATION_KEY); err != nil {
+		return err
+	}
+
 	// Now that the permissions system has been reset, re-run the migration to reinitialise it.
 	a.DoAppMigrations()
 
@@ -65,7 +76,7 @@ func (a *App) ResetPermissionsSystem() *model.AppError {
 
 func (a *App) ExportPermissions(w io.Writer) error {
 
-	next := a.SchemesIterator(permissionsExportBatchSize)
+	next := a.SchemesIterator("", permissionsExportBatchSize)
 	var schemeBatch []*model.Scheme
 
 	for schemeBatch = next(); len(schemeBatch) > 0; schemeBatch = next() {

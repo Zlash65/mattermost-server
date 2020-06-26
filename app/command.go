@@ -4,12 +4,14 @@
 package app
 
 import (
+	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"unicode"
 
 	goi18n "github.com/mattermost/go-i18n/i18n"
 	"github.com/mattermost/mattermost-server/v5/mlog"
@@ -159,10 +161,20 @@ func (a *App) ListAllCommands(teamId string, T goi18n.TranslateFunc) ([]*model.C
 
 // @openTracingParams args
 func (a *App) ExecuteCommand(args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
-	parts := strings.Split(args.Command, " ")
-	trigger := parts[0][1:]
+	trigger := ""
+	message := ""
+	index := strings.IndexFunc(args.Command, unicode.IsSpace)
+	if index != -1 {
+		trigger = args.Command[:index]
+		message = args.Command[index+1:]
+	} else {
+		trigger = args.Command
+	}
 	trigger = strings.ToLower(trigger)
-	message := strings.Join(parts[1:], " ")
+	if !strings.HasPrefix(trigger, "/") {
+		return nil, model.NewAppError("command", "api.command.execute_command.format.app_error", map[string]interface{}{"Trigger": trigger}, "", http.StatusBadRequest)
+	}
+	trigger = strings.TrimPrefix(trigger, "/")
 
 	clientTriggerId, triggerId, appErr := model.GenerateTriggerId(args.UserId, a.AsymmetricSigningKey())
 	if appErr != nil {
@@ -333,7 +345,7 @@ func (a *App) tryExecuteCustomCommand(args *model.CommandArgs, trigger string, m
 	chanChan := make(chan store.StoreResult, 1)
 	go func() {
 		channel, err := a.Srv().Store.Channel().Get(args.ChannelId, true)
-		chanChan <- store.StoreResult{Data: channel, Err: err}
+		chanChan <- store.StoreResult{Data: channel, NErr: err}
 		close(chanChan)
 	}()
 
@@ -369,8 +381,14 @@ func (a *App) tryExecuteCustomCommand(args *model.CommandArgs, trigger string, m
 	user := ur.Data.(*model.User)
 
 	cr := <-chanChan
-	if cr.Err != nil {
-		return nil, nil, cr.Err
+	if cr.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(cr.NErr, &nfErr):
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.channel.get.existing.app_error", nil, nfErr.Error(), http.StatusNotFound)
+		default:
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.channel.get.find.app_error", nil, cr.NErr.Error(), http.StatusInternalServerError)
+		}
 	}
 	channel := cr.Data.(*model.Channel)
 

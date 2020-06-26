@@ -6,6 +6,8 @@ package app
 import (
 	"bytes"
 	"crypto/sha1"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -649,16 +651,39 @@ func (a *App) importUserTeams(user *model.User, data *[]UserTeamImportData) *mod
 		return nil
 	}
 
-	var teamThemePreferences model.Preferences
+	teamNames := []string{}
 	for _, tdata := range *data {
-		team, err := a.GetTeamByName(*tdata.Name)
-		if err != nil {
-			return err
-		}
+		teamNames = append(teamNames, *tdata.Name)
+	}
+	allTeams, err := a.getTeamsByNames(teamNames)
+	if err != nil {
+		return err
+	}
+
+	teamThemePreferencesByID := map[string]model.Preferences{}
+	channels := map[string][]UserChannelImportData{}
+	teamsByID := map[string]*model.Team{}
+	teamMemberByTeamID := map[string]*model.TeamMember{}
+	newTeamMembers := []*model.TeamMember{}
+	oldTeamMembers := []*model.TeamMember{}
+	rolesByTeamId := map[string]string{}
+	isGuestByTeamId := map[string]bool{}
+	isUserByTeamId := map[string]bool{}
+	isAdminByTeamId := map[string]bool{}
+	existingMemberships, err := a.Srv().Store.Team().GetTeamsForUser(user.Id)
+	if err != nil {
+		return err
+	}
+	existingMembershipsByTeamId := map[string]*model.TeamMember{}
+	for _, teamMembership := range existingMemberships {
+		existingMembershipsByTeamId[teamMembership.TeamId] = teamMembership
+	}
+	for _, tdata := range *data {
+		team := allTeams[*tdata.Name]
 
 		// Team-specific theme Preferences.
 		if tdata.Theme != nil {
-			teamThemePreferences = append(teamThemePreferences, model.Preference{
+			teamThemePreferencesByID[team.Id] = append(teamThemePreferencesByID[team.Id], model.Preference{
 				UserId:   user.Id,
 				Category: model.PREFERENCE_CATEGORY_THEME,
 				Name:     team.Id,
@@ -666,63 +691,95 @@ func (a *App) importUserTeams(user *model.User, data *[]UserTeamImportData) *mod
 			})
 		}
 
-		var roles string
-		isSchemeGuest := false
-		isSchemeUser := true
-		isSchemeAdmin := false
+		isGuestByTeamId[team.Id] = false
+		isUserByTeamId[team.Id] = true
+		isAdminByTeamId[team.Id] = false
 
 		if tdata.Roles == nil {
-			isSchemeUser = true
+			isUserByTeamId[team.Id] = true
 		} else {
 			rawRoles := *tdata.Roles
 			explicitRoles := []string{}
 			for _, role := range strings.Fields(rawRoles) {
 				if role == model.TEAM_GUEST_ROLE_ID {
-					isSchemeGuest = true
-					isSchemeUser = false
+					isGuestByTeamId[team.Id] = true
+					isUserByTeamId[team.Id] = false
 				} else if role == model.TEAM_USER_ROLE_ID {
-					isSchemeUser = true
+					isUserByTeamId[team.Id] = true
 				} else if role == model.TEAM_ADMIN_ROLE_ID {
-					isSchemeAdmin = true
+					isAdminByTeamId[team.Id] = true
 				} else {
 					explicitRoles = append(explicitRoles, role)
 				}
 			}
-			roles = strings.Join(explicitRoles, " ")
+			rolesByTeamId[team.Id] = strings.Join(explicitRoles, " ")
 		}
 
-		var member *model.TeamMember
-		if member, _, err = a.joinUserToTeam(team, user); err != nil {
-			return err
+		member := &model.TeamMember{
+			TeamId:      team.Id,
+			UserId:      user.Id,
+			SchemeGuest: user.IsGuest(),
+			SchemeUser:  !user.IsGuest(),
+			SchemeAdmin: team.Email == user.Email && !user.IsGuest(),
 		}
-
-		if member.ExplicitRoles != roles {
-			if _, err = a.UpdateTeamMemberRoles(team.Id, user.Id, roles); err != nil {
+		if !user.IsGuest() {
+			var userShouldBeAdmin bool
+			userShouldBeAdmin, err = a.UserIsInAdminRoleGroup(user.Id, team.Id, model.GroupSyncableTypeTeam)
+			if err != nil {
 				return err
 			}
+			member.SchemeAdmin = userShouldBeAdmin
 		}
 
-		if member.SchemeAdmin != isSchemeAdmin || member.SchemeUser != isSchemeUser || member.SchemeGuest != isSchemeGuest {
-			a.UpdateTeamMemberSchemeRoles(team.Id, user.Id, isSchemeGuest, isSchemeUser, isSchemeAdmin)
+		if tdata.Channels != nil {
+			channels[team.Id] = append(channels[team.Id], *tdata.Channels...)
+		}
+		if !user.IsGuest() {
+			channels[team.Id] = append(channels[team.Id], UserChannelImportData{Name: model.NewString(model.DEFAULT_CHANNEL)})
 		}
 
-		defaultChannel, err := a.GetChannelByName(model.DEFAULT_CHANNEL, team.Id, true)
+		teamsByID[team.Id] = team
+		teamMemberByTeamID[team.Id] = member
+		if _, ok := existingMembershipsByTeamId[team.Id]; !ok {
+			newTeamMembers = append(newTeamMembers, member)
+		} else {
+			oldTeamMembers = append(oldTeamMembers, member)
+		}
+	}
+
+	oldMembers, err := a.Srv().Store.Team().UpdateMultipleMembers(oldTeamMembers)
+	if err != nil {
+		return err
+	}
+
+	newMembers := []*model.TeamMember{}
+	if len(newTeamMembers) > 0 {
+		newMembers, err = a.Srv().Store.Team().SaveMultipleMembers(newTeamMembers, *a.Config().TeamSettings.MaxUsersPerTeam)
 		if err != nil {
-			return err
-		}
-
-		if _, err = a.addUserToChannel(user, defaultChannel, member); err != nil {
-			return err
-		}
-
-		if err := a.importUserChannels(user, team, member, tdata.Channels); err != nil {
 			return err
 		}
 	}
 
-	if len(teamThemePreferences) > 0 {
-		if err := a.Srv().Store.Preference().Save(&teamThemePreferences); err != nil {
-			return model.NewAppError("BulkImport", "app.import.import_user_teams.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
+	for _, member := range append(newMembers, oldMembers...) {
+		if member.ExplicitRoles != rolesByTeamId[member.TeamId] {
+			if _, err = a.UpdateTeamMemberRoles(member.TeamId, user.Id, rolesByTeamId[member.TeamId]); err != nil {
+				return err
+			}
+		}
+
+		a.UpdateTeamMemberSchemeRoles(member.TeamId, user.Id, isGuestByTeamId[member.TeamId], isUserByTeamId[member.TeamId], isAdminByTeamId[member.TeamId])
+	}
+
+	for _, team := range allTeams {
+		if len(teamThemePreferencesByID[team.Id]) > 0 {
+			pref := teamThemePreferencesByID[team.Id]
+			if err := a.Srv().Store.Preference().Save(&pref); err != nil {
+				return model.NewAppError("BulkImport", "app.import.import_user_teams.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
+			}
+		}
+		channelsToImport := channels[team.Id]
+		if err := a.importUserChannels(user, team, teamMemberByTeamID[team.Id], &channelsToImport); err != nil {
+			return err
 		}
 	}
 
@@ -734,92 +791,144 @@ func (a *App) importUserChannels(user *model.User, team *model.Team, teamMember 
 		return nil
 	}
 
-	var preferences model.Preferences
+	channelNames := []string{}
+	for _, tdata := range *data {
+		channelNames = append(channelNames, *tdata.Name)
+	}
+	allChannels, err := a.getChannelsByNames(channelNames, team.Id)
+	if err != nil {
+		return err
+	}
 
-	// Loop through all channels.
+	channelsByID := map[string]*model.Channel{}
+	channelMemberByChannelID := map[string]*model.ChannelMember{}
+	newChannelMembers := []*model.ChannelMember{}
+	oldChannelMembers := []*model.ChannelMember{}
+	rolesByChannelId := map[string]string{}
+	channelPreferencesByID := map[string]model.Preferences{}
+	isGuestByChannelId := map[string]bool{}
+	isUserByChannelId := map[string]bool{}
+	isAdminByChannelId := map[string]bool{}
+	existingMemberships, err := a.Srv().Store.Channel().GetMembersForUser(team.Id, user.Id)
+	if err != nil {
+		return err
+	}
+	existingMembershipsByChannelId := map[string]model.ChannelMember{}
+	for _, channelMembership := range *existingMemberships {
+		existingMembershipsByChannelId[channelMembership.ChannelId] = channelMembership
+	}
 	for _, cdata := range *data {
-		channel, err := a.GetChannelByName(*cdata.Name, team.Id, true)
-		if err != nil {
-			return err
+		channel, ok := allChannels[*cdata.Name]
+		if !ok {
+			return model.NewAppError("BulkImport", "app.import.import_user_channels.channel_not_found.error", nil, "", http.StatusInternalServerError)
+		}
+		if _, ok = channelsByID[channel.Id]; ok && *cdata.Name == model.DEFAULT_CHANNEL {
+			// town-square membership was in the import and added by the importer (skip the added by the importer)
+			continue
 		}
 
-		var roles string
-		isSchemeGuest := false
-		isSchemeUser := true
-		isSchemeAdmin := false
+		isGuestByChannelId[channel.Id] = false
+		isUserByChannelId[channel.Id] = true
+		isAdminByChannelId[channel.Id] = false
 
 		if cdata.Roles == nil {
-			isSchemeUser = true
+			isUserByChannelId[channel.Id] = true
 		} else {
 			rawRoles := *cdata.Roles
 			explicitRoles := []string{}
 			for _, role := range strings.Fields(rawRoles) {
 				if role == model.CHANNEL_GUEST_ROLE_ID {
-					isSchemeGuest = true
-					isSchemeUser = false
+					isGuestByChannelId[channel.Id] = true
+					isUserByChannelId[channel.Id] = false
 				} else if role == model.CHANNEL_USER_ROLE_ID {
-					isSchemeUser = true
+					isUserByChannelId[channel.Id] = true
 				} else if role == model.CHANNEL_ADMIN_ROLE_ID {
-					isSchemeAdmin = true
+					isAdminByChannelId[channel.Id] = true
 				} else {
 					explicitRoles = append(explicitRoles, role)
 				}
 			}
-			roles = strings.Join(explicitRoles, " ")
-		}
-
-		var member *model.ChannelMember
-		member, err = a.GetChannelMember(channel.Id, user.Id)
-		if err != nil {
-			member, err = a.addUserToChannel(user, channel, teamMember)
-			if err != nil {
-				return err
-			}
-		}
-
-		if member.ExplicitRoles != roles {
-			if _, err := a.UpdateChannelMemberRoles(channel.Id, user.Id, roles); err != nil {
-				return err
-			}
-		}
-
-		if member.SchemeAdmin != isSchemeAdmin || member.SchemeUser != isSchemeUser || member.SchemeGuest != isSchemeGuest {
-			a.UpdateChannelMemberSchemeRoles(channel.Id, user.Id, isSchemeGuest, isSchemeUser, isSchemeAdmin)
-		}
-
-		if cdata.NotifyProps != nil {
-			notifyProps := member.NotifyProps
-
-			if cdata.NotifyProps.Desktop != nil {
-				notifyProps[model.DESKTOP_NOTIFY_PROP] = *cdata.NotifyProps.Desktop
-			}
-
-			if cdata.NotifyProps.Mobile != nil {
-				notifyProps[model.PUSH_NOTIFY_PROP] = *cdata.NotifyProps.Mobile
-			}
-
-			if cdata.NotifyProps.MarkUnread != nil {
-				notifyProps[model.MARK_UNREAD_NOTIFY_PROP] = *cdata.NotifyProps.MarkUnread
-			}
-
-			if _, err := a.UpdateChannelMemberNotifyProps(notifyProps, channel.Id, user.Id); err != nil {
-				return err
-			}
+			rolesByChannelId[channel.Id] = strings.Join(explicitRoles, " ")
 		}
 
 		if cdata.Favorite != nil && *cdata.Favorite {
-			preferences = append(preferences, model.Preference{
+			channelPreferencesByID[channel.Id] = append(channelPreferencesByID[channel.Id], model.Preference{
 				UserId:   user.Id,
 				Category: model.PREFERENCE_CATEGORY_FAVORITE_CHANNEL,
 				Name:     channel.Id,
 				Value:    "true",
 			})
 		}
+
+		member := &model.ChannelMember{
+			ChannelId:   channel.Id,
+			UserId:      user.Id,
+			NotifyProps: model.GetDefaultChannelNotifyProps(),
+			SchemeGuest: user.IsGuest(),
+			SchemeUser:  !user.IsGuest(),
+			SchemeAdmin: false,
+		}
+		if !user.IsGuest() {
+			var userShouldBeAdmin bool
+			userShouldBeAdmin, err = a.UserIsInAdminRoleGroup(user.Id, team.Id, model.GroupSyncableTypeTeam)
+			if err != nil {
+				return err
+			}
+			member.SchemeAdmin = userShouldBeAdmin
+		}
+
+		if cdata.NotifyProps != nil {
+			if cdata.NotifyProps.Desktop != nil {
+				member.NotifyProps[model.DESKTOP_NOTIFY_PROP] = *cdata.NotifyProps.Desktop
+			}
+
+			if cdata.NotifyProps.Mobile != nil {
+				member.NotifyProps[model.PUSH_NOTIFY_PROP] = *cdata.NotifyProps.Mobile
+			}
+
+			if cdata.NotifyProps.MarkUnread != nil {
+				member.NotifyProps[model.MARK_UNREAD_NOTIFY_PROP] = *cdata.NotifyProps.MarkUnread
+			}
+		}
+
+		channelsByID[channel.Id] = channel
+		channelMemberByChannelID[channel.Id] = member
+		if _, ok := existingMembershipsByChannelId[channel.Id]; !ok {
+			newChannelMembers = append(newChannelMembers, member)
+		} else {
+			oldChannelMembers = append(oldChannelMembers, member)
+		}
 	}
 
-	if len(preferences) > 0 {
-		if err := a.Srv().Store.Preference().Save(&preferences); err != nil {
-			return model.NewAppError("BulkImport", "app.import.import_user_channels.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
+	oldMembers, err := a.Srv().Store.Channel().UpdateMultipleMembers(oldChannelMembers)
+	if err != nil {
+		return err
+	}
+
+	newMembers := []*model.ChannelMember{}
+	if len(newChannelMembers) > 0 {
+		newMembers, err = a.Srv().Store.Channel().SaveMultipleMembers(newChannelMembers)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, member := range append(newMembers, oldMembers...) {
+		if member.ExplicitRoles != rolesByChannelId[member.ChannelId] {
+			if _, err = a.UpdateChannelMemberRoles(member.ChannelId, user.Id, rolesByChannelId[member.ChannelId]); err != nil {
+				return err
+			}
+		}
+
+		a.UpdateChannelMemberSchemeRoles(member.ChannelId, user.Id, isGuestByChannelId[member.ChannelId], isUserByChannelId[member.ChannelId], isAdminByChannelId[member.ChannelId])
+	}
+
+	for _, channel := range allChannels {
+		if len(channelPreferencesByID[channel.Id]) > 0 {
+			pref := channelPreferencesByID[channel.Id]
+			if err := a.Srv().Store.Preference().Save(&pref); err != nil {
+				return model.NewAppError("BulkImport", "app.import.import_user_channels.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
+			}
 		}
 	}
 
@@ -922,12 +1031,12 @@ func (a *App) importReplies(data []ReplyImportData, post *model.Post, teamId str
 	}
 
 	if len(postsForCreateList) > 0 {
-		if _, err := a.Srv().Store.Post().SaveMultiple(postsForCreateList); err != nil {
+		if _, _, err := a.Srv().Store.Post().SaveMultiple(postsForCreateList); err != nil {
 			return err
 		}
 	}
 
-	if _, err := a.Srv().Store.Post().OverwriteMultiple(postsForOverwriteList); err != nil {
+	if _, _, err := a.Srv().Store.Post().OverwriteMultiple(postsForOverwriteList); err != nil {
 		return err
 	}
 
@@ -973,7 +1082,7 @@ func (a *App) importAttachment(data *AttachmentImportData, post *model.Post, tea
 	}
 	fileInfo, appErr := a.DoUploadFile(timestamp, teamId, post.ChannelId, post.UserId, file.Name(), buf.Bytes())
 	if appErr != nil {
-		mlog.Error("Failed to upload file:", mlog.Err(err))
+		mlog.Error("Failed to upload file:", mlog.Err(appErr))
 		return nil, appErr
 	}
 
@@ -989,6 +1098,7 @@ type postAndData struct {
 	directPostData *DirectPostImportData
 	replyData      *ReplyImportData
 	team           *model.Team
+	lineNumber     int
 }
 
 func (a *App) getUsersByUsernames(usernames []string) (map[string]*model.User, *model.AppError) {
@@ -1022,12 +1132,25 @@ func (a *App) getTeamsByNames(names []string) (map[string]*model.Team, *model.Ap
 	return teams, nil
 }
 
+func (a *App) getChannelsByNames(names []string, teamId string) (map[string]*model.Channel, *model.AppError) {
+	allChannels, err := a.Srv().Store.Channel().GetByNames(teamId, names, true)
+	if err != nil {
+		return nil, model.NewAppError("BulkImport", "app.import.get_teams_by_names.some_teams_not_found.error", nil, err.Error(), http.StatusBadRequest)
+	}
+
+	channels := make(map[string]*model.Channel)
+	for _, channel := range allChannels {
+		channels[channel.Name] = channel
+	}
+	return channels, nil
+}
+
 func (a *App) getChannelsForPosts(teams map[string]*model.Team, data []*PostImportData) (map[string]*model.Channel, *model.AppError) {
 	channels := make(map[string]*model.Channel)
 	for _, postData := range data {
 		team := teams[*postData.Team]
 		if channel, ok := channels[*postData.Channel]; !ok || channel == nil {
-			var err *model.AppError
+			var err error
 			channel, err = a.Srv().Store.Channel().GetByName(team.Id, *postData.Channel, true)
 			if err != nil {
 				return nil, model.NewAppError("BulkImport", "app.import.import_post.channel_not_found.error", map[string]interface{}{"ChannelName": *postData.Channel}, err.Error(), http.StatusBadRequest)
@@ -1038,64 +1161,76 @@ func (a *App) getChannelsForPosts(teams map[string]*model.Team, data []*PostImpo
 	return channels, nil
 }
 
-func (a *App) importMultiplePosts(data []*PostImportData, dryRun bool) *model.AppError {
-	if len(data) == 0 {
-		return nil
+// getPostStrID returns a string ID composed of several post fields to
+// uniquely identify a post before it's imported, so it has no ID yet
+func getPostStrID(post *model.Post) string {
+	return fmt.Sprintf("%d%s%s", post.CreateAt, post.ChannelId, post.Message)
+}
+
+// importMultiplePostLines will return an error and the line that
+// caused it whenever possible
+func (a *App) importMultiplePostLines(lines []LineImportWorkerData, dryRun bool) (int, *model.AppError) {
+	if len(lines) == 0 {
+		return 0, nil
 	}
 
-	for _, postData := range data {
-		if err := validatePostImportData(postData, a.MaxPostSize()); err != nil {
-			return err
+	for _, line := range lines {
+		if err := validatePostImportData(line.Post, a.MaxPostSize()); err != nil {
+			return line.LineNumber, err
 		}
 	}
 
 	// If this is a Dry Run, do not continue any further.
 	if dryRun {
-		return nil
+		return 0, nil
 	}
 
 	usernames := []string{}
-	teamNames := []string{}
-	for _, postData := range data {
-		usernames = append(usernames, *postData.User)
-		if postData.FlaggedBy != nil {
-			usernames = append(usernames, *postData.FlaggedBy...)
+	teamNames := make([]string, len(lines))
+	postsData := make([]*PostImportData, len(lines))
+	for i, line := range lines {
+		usernames = append(usernames, *line.Post.User)
+		if line.Post.FlaggedBy != nil {
+			usernames = append(usernames, *line.Post.FlaggedBy...)
 		}
-		teamNames = append(teamNames, *postData.Team)
+		teamNames[i] = *line.Post.Team
+		postsData[i] = line.Post
 	}
 
 	users, err := a.getUsersByUsernames(usernames)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	teams, err := a.getTeamsByNames(teamNames)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	channels, err := a.getChannelsForPosts(teams, data)
+	channels, err := a.getChannelsForPosts(teams, postsData)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	postsWithData := []postAndData{}
 	postsForCreateList := []*model.Post{}
+	postsForCreateMap := map[string]int{}
 	postsForOverwriteList := []*model.Post{}
+	postsForOverwriteMap := map[string]int{}
 
-	for _, postData := range data {
-		team := teams[*postData.Team]
-		channel := channels[*postData.Channel]
-		user := users[*postData.User]
+	for _, line := range lines {
+		team := teams[*line.Post.Team]
+		channel := channels[*line.Post.Channel]
+		user := users[*line.Post.User]
 
 		// Check if this post already exists.
-		posts, err := a.Srv().Store.Post().GetPostsCreatedAt(channel.Id, *postData.CreateAt)
+		posts, err := a.Srv().Store.Post().GetPostsCreatedAt(channel.Id, *line.Post.CreateAt)
 		if err != nil {
-			return err
+			return line.LineNumber, err
 		}
 
 		var post *model.Post
 		for _, p := range posts {
-			if p.Message == *postData.Message {
+			if p.Message == *line.Post.Message {
 				post = p
 				break
 			}
@@ -1106,14 +1241,18 @@ func (a *App) importMultiplePosts(data []*PostImportData, dryRun bool) *model.Ap
 		}
 
 		post.ChannelId = channel.Id
-		post.Message = *postData.Message
+		post.Message = *line.Post.Message
 		post.UserId = user.Id
-		post.CreateAt = *postData.CreateAt
+		post.CreateAt = *line.Post.CreateAt
 		post.Hashtags, _ = model.ParseHashtags(post.Message)
 
-		fileIds, err := a.uploadAttachments(postData.Attachments, post, team.Id, dryRun)
+		if line.Post.Props != nil {
+			post.Props = *line.Post.Props
+		}
+
+		fileIds, err := a.uploadAttachments(line.Post.Attachments, post, team.Id, dryRun)
 		if err != nil {
-			return err
+			return line.LineNumber, err
 		}
 		for _, fileID := range post.FileIds {
 			if _, ok := fileIds[fileID]; !ok {
@@ -1127,24 +1266,36 @@ func (a *App) importMultiplePosts(data []*PostImportData, dryRun bool) *model.Ap
 
 		if len(post.Id) == 0 {
 			postsForCreateList = append(postsForCreateList, post)
+			postsForCreateMap[getPostStrID(post)] = line.LineNumber
 		} else {
 			postsForOverwriteList = append(postsForOverwriteList, post)
+			postsForOverwriteMap[getPostStrID(post)] = line.LineNumber
 		}
-		postsWithData = append(postsWithData, postAndData{post: post, postData: postData, team: team})
+		postsWithData = append(postsWithData, postAndData{post: post, postData: line.Post, team: team, lineNumber: line.LineNumber})
 	}
 
 	if len(postsForCreateList) > 0 {
-		if _, err := a.Srv().Store.Post().SaveMultiple(postsForCreateList); err != nil {
-			return err
+		if _, idx, err := a.Srv().Store.Post().SaveMultiple(postsForCreateList); err != nil {
+			if idx != -1 && idx < len(postsForCreateList) {
+				post := postsForCreateList[idx]
+				if lineNumber, ok := postsForCreateMap[getPostStrID(post)]; ok {
+					return lineNumber, err
+				}
+			}
+			return 0, err
 		}
 	}
 
-	if _, err := a.Srv().Store.Post().OverwriteMultiple(postsForOverwriteList); err != nil {
-		return err
+	if _, idx, err := a.Srv().Store.Post().OverwriteMultiple(postsForOverwriteList); err != nil {
+		if idx != -1 && idx < len(postsForOverwriteList) {
+			post := postsForOverwriteList[idx]
+			if lineNumber, ok := postsForOverwriteMap[getPostStrID(post)]; ok {
+				return lineNumber, err
+			}
+		}
+		return 0, err
 	}
 
-	var lastPostWithData *postAndData
-	repliesBulk := []ReplyImportData{}
 	for _, postWithData := range postsWithData {
 		postWithData := postWithData
 		if postWithData.postData.FlaggedBy != nil {
@@ -1163,7 +1314,7 @@ func (a *App) importMultiplePosts(data []*PostImportData, dryRun bool) *model.Ap
 
 			if len(preferences) > 0 {
 				if err := a.Srv().Store.Preference().Save(&preferences); err != nil {
-					return model.NewAppError("BulkImport", "app.import.import_post.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
+					return postWithData.lineNumber, model.NewAppError("BulkImport", "app.import.import_post.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
 				}
 			}
 		}
@@ -1172,33 +1323,20 @@ func (a *App) importMultiplePosts(data []*PostImportData, dryRun bool) *model.Ap
 			for _, reaction := range *postWithData.postData.Reactions {
 				reaction := reaction
 				if err := a.importReaction(&reaction, postWithData.post, dryRun); err != nil {
-					return err
+					return postWithData.lineNumber, err
 				}
 			}
 		}
 
-		if postWithData.postData.Replies != nil {
-			repliesBulk = append(repliesBulk, *postWithData.postData.Replies...)
-			if len(repliesBulk) >= importMultiplePostsThreshold {
-				err := a.importReplies(repliesBulk, postWithData.post, postWithData.team.Id, dryRun)
-				if err != nil {
-					return err
-				}
-				repliesBulk = []ReplyImportData{}
+		if postWithData.postData.Replies != nil && len(*postWithData.postData.Replies) > 0 {
+			err := a.importReplies(*postWithData.postData.Replies, postWithData.post, postWithData.team.Id, dryRun)
+			if err != nil {
+				return postWithData.lineNumber, err
 			}
 		}
 		a.updateFileInfoWithPostId(postWithData.post)
-		lastPostWithData = &postWithData
 	}
-
-	if len(repliesBulk) >= 0 && lastPostWithData != nil {
-		err := a.importReplies(repliesBulk, lastPostWithData.post, lastPostWithData.team.Id, dryRun)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return 0, nil
 }
 
 // uploadAttachments imports new attachments and returns current attachments of the post as a map
@@ -1298,44 +1436,48 @@ func (a *App) importDirectChannel(data *DirectChannelImportData, dryRun bool) *m
 	return nil
 }
 
-func (a *App) importMultipleDirectPosts(data []*DirectPostImportData, dryRun bool) *model.AppError {
-	if len(data) == 0 {
-		return nil
+// importMultipleDirectPostLines will return an error and the line
+// that caused it whenever possible
+func (a *App) importMultipleDirectPostLines(lines []LineImportWorkerData, dryRun bool) (int, *model.AppError) {
+	if len(lines) == 0 {
+		return 0, nil
 	}
 
-	for _, postData := range data {
-		if err := validateDirectPostImportData(postData, a.MaxPostSize()); err != nil {
-			return err
+	for _, line := range lines {
+		if err := validateDirectPostImportData(line.DirectPost, a.MaxPostSize()); err != nil {
+			return line.LineNumber, err
 		}
 	}
 
 	// If this is a Dry Run, do not continue any further.
 	if dryRun {
-		return nil
+		return 0, nil
 	}
 
 	usernames := []string{}
-	for _, postData := range data {
-		usernames = append(usernames, *postData.User)
-		if postData.FlaggedBy != nil {
-			usernames = append(usernames, *postData.FlaggedBy...)
+	for _, line := range lines {
+		usernames = append(usernames, *line.DirectPost.User)
+		if line.DirectPost.FlaggedBy != nil {
+			usernames = append(usernames, *line.DirectPost.FlaggedBy...)
 		}
-		usernames = append(usernames, *postData.ChannelMembers...)
+		usernames = append(usernames, *line.DirectPost.ChannelMembers...)
 	}
 
 	users, err := a.getUsersByUsernames(usernames)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	postsWithData := []postAndData{}
 	postsForCreateList := []*model.Post{}
+	postsForCreateMap := map[string]int{}
 	postsForOverwriteList := []*model.Post{}
+	postsForOverwriteMap := map[string]int{}
 
-	for _, postData := range data {
+	for _, line := range lines {
 		var userIds []string
 		var err *model.AppError
-		for _, username := range *postData.ChannelMembers {
+		for _, username := range *line.DirectPost.ChannelMembers {
 			user := users[username]
 			userIds = append(userIds, user.Id)
 		}
@@ -1345,28 +1487,28 @@ func (a *App) importMultipleDirectPosts(data []*DirectPostImportData, dryRun boo
 		if len(userIds) == 2 {
 			ch, err = a.GetOrCreateDirectChannel(userIds[0], userIds[1])
 			if err != nil && err.Id != store.CHANNEL_EXISTS_ERROR {
-				return model.NewAppError("BulkImport", "app.import.import_direct_post.create_direct_channel.error", nil, err.Error(), http.StatusBadRequest)
+				return line.LineNumber, model.NewAppError("BulkImport", "app.import.import_direct_post.create_direct_channel.error", nil, err.Error(), http.StatusBadRequest)
 			}
 			channel = ch
 		} else {
 			ch, err = a.createGroupChannel(userIds, userIds[0])
 			if err != nil && err.Id != store.CHANNEL_EXISTS_ERROR {
-				return model.NewAppError("BulkImport", "app.import.import_direct_post.create_group_channel.error", nil, err.Error(), http.StatusBadRequest)
+				return line.LineNumber, model.NewAppError("BulkImport", "app.import.import_direct_post.create_group_channel.error", nil, err.Error(), http.StatusBadRequest)
 			}
 			channel = ch
 		}
 
-		user := users[*postData.User]
+		user := users[*line.DirectPost.User]
 
 		// Check if this post already exists.
-		posts, err := a.Srv().Store.Post().GetPostsCreatedAt(channel.Id, *postData.CreateAt)
+		posts, err := a.Srv().Store.Post().GetPostsCreatedAt(channel.Id, *line.DirectPost.CreateAt)
 		if err != nil {
-			return err
+			return line.LineNumber, err
 		}
 
 		var post *model.Post
 		for _, p := range posts {
-			if p.Message == *postData.Message {
+			if p.Message == *line.DirectPost.Message {
 				post = p
 				break
 			}
@@ -1377,14 +1519,18 @@ func (a *App) importMultipleDirectPosts(data []*DirectPostImportData, dryRun boo
 		}
 
 		post.ChannelId = channel.Id
-		post.Message = *postData.Message
+		post.Message = *line.DirectPost.Message
 		post.UserId = user.Id
-		post.CreateAt = *postData.CreateAt
+		post.CreateAt = *line.DirectPost.CreateAt
 		post.Hashtags, _ = model.ParseHashtags(post.Message)
 
-		fileIds, err := a.uploadAttachments(postData.Attachments, post, "noteam", dryRun)
+		if line.DirectPost.Props != nil {
+			post.Props = *line.DirectPost.Props
+		}
+
+		fileIds, err := a.uploadAttachments(line.DirectPost.Attachments, post, "noteam", dryRun)
 		if err != nil {
-			return err
+			return line.LineNumber, err
 		}
 		for _, fileID := range post.FileIds {
 			if _, ok := fileIds[fileID]; !ok {
@@ -1398,19 +1544,33 @@ func (a *App) importMultipleDirectPosts(data []*DirectPostImportData, dryRun boo
 
 		if len(post.Id) == 0 {
 			postsForCreateList = append(postsForCreateList, post)
+			postsForCreateMap[getPostStrID(post)] = line.LineNumber
 		} else {
 			postsForOverwriteList = append(postsForOverwriteList, post)
+			postsForOverwriteMap[getPostStrID(post)] = line.LineNumber
 		}
-		postsWithData = append(postsWithData, postAndData{post: post, directPostData: postData})
+		postsWithData = append(postsWithData, postAndData{post: post, directPostData: line.DirectPost, lineNumber: line.LineNumber})
 	}
 
 	if len(postsForCreateList) > 0 {
-		if _, err := a.Srv().Store.Post().SaveMultiple(postsForCreateList); err != nil {
-			return err
+		if _, idx, err := a.Srv().Store.Post().SaveMultiple(postsForCreateList); err != nil {
+			if idx != -1 && idx < len(postsForCreateList) {
+				post := postsForCreateList[idx]
+				if lineNumber, ok := postsForCreateMap[getPostStrID(post)]; ok {
+					return lineNumber, err
+				}
+			}
+			return 0, err
 		}
 	}
-	if _, err := a.Srv().Store.Post().OverwriteMultiple(postsForOverwriteList); err != nil {
-		return err
+	if _, idx, err := a.Srv().Store.Post().OverwriteMultiple(postsForOverwriteList); err != nil {
+		if idx != -1 && idx < len(postsForOverwriteList) {
+			post := postsForOverwriteList[idx]
+			if lineNumber, ok := postsForOverwriteMap[getPostStrID(post)]; ok {
+				return lineNumber, err
+			}
+		}
+		return 0, err
 	}
 
 	for _, postWithData := range postsWithData {
@@ -1430,7 +1590,7 @@ func (a *App) importMultipleDirectPosts(data []*DirectPostImportData, dryRun boo
 
 			if len(preferences) > 0 {
 				if err := a.Srv().Store.Preference().Save(&preferences); err != nil {
-					return model.NewAppError("BulkImport", "app.import.import_post.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
+					return postWithData.lineNumber, model.NewAppError("BulkImport", "app.import.import_post.save_preferences.error", nil, err.Error(), http.StatusInternalServerError)
 				}
 			}
 		}
@@ -1439,20 +1599,20 @@ func (a *App) importMultipleDirectPosts(data []*DirectPostImportData, dryRun boo
 			for _, reaction := range *postWithData.directPostData.Reactions {
 				reaction := reaction
 				if err := a.importReaction(&reaction, postWithData.post, dryRun); err != nil {
-					return err
+					return postWithData.lineNumber, err
 				}
 			}
 		}
 
 		if postWithData.directPostData.Replies != nil {
 			if err := a.importReplies(*postWithData.directPostData.Replies, postWithData.post, "noteam", dryRun); err != nil {
-				return err
+				return postWithData.lineNumber, err
 			}
 		}
 
 		a.updateFileInfoWithPostId(postWithData.post)
 	}
-	return nil
+	return 0, nil
 }
 
 func (a *App) importEmoji(data *EmojiImportData, dryRun bool) *model.AppError {
@@ -1467,9 +1627,12 @@ func (a *App) importEmoji(data *EmojiImportData, dryRun bool) *model.AppError {
 
 	var emoji *model.Emoji
 
-	emoji, appError := a.Srv().Store.Emoji().GetByName(*data.Name, true)
-	if appError != nil && appError.StatusCode != http.StatusNotFound {
-		return appError
+	emoji, err := a.Srv().Store.Emoji().GetByName(*data.Name, true)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		if !errors.As(err, &nfErr) {
+			return model.NewAppError("importEmoji", "app.emoji.get_by_name.app_error", nil, err.Error(), http.StatusInternalServerError)
+		}
 	}
 
 	alreadyExists := emoji != nil
@@ -1492,7 +1655,7 @@ func (a *App) importEmoji(data *EmojiImportData, dryRun bool) *model.AppError {
 
 	if !alreadyExists {
 		if _, err := a.Srv().Store.Emoji().Save(emoji); err != nil {
-			return err
+			return model.NewAppError("importEmoji", "api.emoji.create.internal_error", nil, err.Error(), http.StatusBadRequest)
 		}
 	}
 

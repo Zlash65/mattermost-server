@@ -63,7 +63,7 @@ func TestPluginVersion(t *testing.T) {
 	assert.Empty(t, pluginVersion(plugins, "unknown.plugin"))
 }
 
-func TestDiagnostics(t *testing.T) {
+func TestRudderDiagnostics(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
 	}
@@ -109,6 +109,7 @@ func TestDiagnostics(t *testing.T) {
 	th.Server.initDiagnostics(server.URL)
 
 	assertPayload := func(t *testing.T, actual payload, event string, properties map[string]interface{}) {
+		t.Helper()
 		assert.NotEmpty(t, actual.MessageId)
 		assert.False(t, actual.SentAt.IsZero())
 		if assert.Len(t, actual.Batch, 1) {
@@ -126,6 +127,19 @@ func TestDiagnostics(t *testing.T) {
 		assert.Equal(t, "3.0.0", actual.Context.Library.Version)
 	}
 
+	collectInfo := func(info *[]string) {
+		t.Helper()
+		for {
+			select {
+			case result := <-data:
+				assertPayload(t, result, "", nil)
+				*info = append(*info, result.Batch[0].Event)
+			case <-time.After(time.Second * 1):
+				return
+			}
+		}
+	}
+
 	// Should send a client identify message
 	select {
 	case identifyMessage := <-data:
@@ -136,7 +150,7 @@ func TestDiagnostics(t *testing.T) {
 
 	t.Run("Send", func(t *testing.T) {
 		testValue := "test-send-value-6789"
-		th.App.SendDiagnostic("Testing Diagnostic", map[string]interface{}{
+		th.App.Srv().SendDiagnostic("Testing Diagnostic", map[string]interface{}{
 			"hey": testValue,
 		})
 		select {
@@ -151,20 +165,11 @@ func TestDiagnostics(t *testing.T) {
 
 	// Plugins remain disabled at this point
 	t.Run("SendDailyDiagnosticsPluginsDisabled", func(t *testing.T) {
-		th.App.sendDailyDiagnostics(true)
+		th.App.Srv().sendDailyDiagnostics(true)
 
 		var info []string
 		// Collect the info sent.
-	Loop:
-		for {
-			select {
-			case result := <-data:
-				assertPayload(t, result, "", nil)
-				info = append(info, result.Batch[0].Event)
-			case <-time.After(time.Second * 1):
-				break Loop
-			}
-		}
+		collectInfo(&info)
 
 		for _, item := range []string{
 			TRACK_CONFIG_SERVICE,
@@ -202,20 +207,11 @@ func TestDiagnostics(t *testing.T) {
 	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.PluginSettings.Enable = true })
 
 	t.Run("SendDailyDiagnostics", func(t *testing.T) {
-		th.App.sendDailyDiagnostics(true)
+		th.App.Srv().sendDailyDiagnostics(true)
 
 		var info []string
 		// Collect the info sent.
-	Loop:
-		for {
-			select {
-			case result := <-data:
-				assertPayload(t, result, "", nil)
-				info = append(info, result.Batch[0].Event)
-			case <-time.After(time.Second * 1):
-				break Loop
-			}
-		}
+		collectInfo(&info)
 
 		for _, item := range []string{
 			TRACK_CONFIG_SERVICE,
@@ -249,12 +245,12 @@ func TestDiagnostics(t *testing.T) {
 		}
 	})
 
-	t.Run("SendDailyDiagnosticsNoSegmentKey", func(t *testing.T) {
-		th.App.SendDailyDiagnostics()
+	t.Run("SendDailyDiagnosticsNoRudderKey", func(t *testing.T) {
+		th.App.Srv().SendDailyDiagnostics()
 
 		select {
 		case <-data:
-			require.Fail(t, "Should not send diagnostics when the segment key is not set")
+			require.Fail(t, "Should not send diagnostics when the rudder key is not set")
 		case <-time.After(time.Second * 1):
 			// Did not receive diagnostics
 		}
@@ -263,7 +259,7 @@ func TestDiagnostics(t *testing.T) {
 	t.Run("SendDailyDiagnosticsDisabled", func(t *testing.T) {
 		th.App.UpdateConfig(func(cfg *model.Config) { *cfg.LogSettings.EnableDiagnostics = false })
 
-		th.App.sendDailyDiagnostics(true)
+		th.App.Srv().sendDailyDiagnostics(true)
 
 		select {
 		case <-data:
